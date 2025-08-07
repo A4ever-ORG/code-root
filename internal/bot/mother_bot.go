@@ -3,7 +3,6 @@ package bot
 import (
         "fmt"
         "log"
-        "strconv"
         "strings"
         "telegram-store-hub/internal/messages"
         "telegram-store-hub/internal/models"
@@ -289,17 +288,26 @@ func (mb *MotherBot) handlePlanSelection(chatID int64, planType models.PlanType)
 func (mb *MotherBot) createFreeStore(chatID int64) {
         // Check if user already has a store
         var existingStore models.Store
-        result := mb.db.Where("owner_chat_id = ?", chatID).First(&existingStore)
+        // First get the user ID from telegram ID
+        var user models.User
+        userResult := mb.db.Where("telegram_id = ?", chatID).First(&user)
+        if userResult.Error != nil {
+                msg := tgbotapi.NewMessage(chatID, "❌ لطفاً ابتدا با /start شروع کنید")
+                mb.bot.Send(msg)
+                return
+        }
+        
+        result := mb.db.Where("owner_id = ?", user.ID).First(&existingStore)
         if result.Error == nil {
                 msg := tgbotapi.NewMessage(chatID, "⚠️ شما قبلاً یک فروشگاه ثبت کرده‌اید!")
                 mb.bot.Send(msg)
                 return
         }
 
-        // Create new store
+        // Create new store with proper user reference
         store := models.Store{
-                OwnerChatID: chatID,
-                StoreName:   fmt.Sprintf("Store_%d", chatID),
+                OwnerID: user.ID,
+                Name:    fmt.Sprintf("Store_%d", chatID),
                 PlanType:    models.PlanFree,
                 ExpiresAt:   time.Now().AddDate(0, 1, 0), // 1 month for free
                 IsActive:    true,
@@ -339,7 +347,16 @@ func (mb *MotherBot) createFreeStore(chatID int64) {
 
 func (mb *MotherBot) showStoreManagement(chatID int64) {
         var store models.Store
-        result := mb.db.Where("owner_chat_id = ? AND is_active = ?", chatID, true).First(&store)
+        // Get user first, then find their stores
+        var user models.User
+        userResult := mb.db.Where("telegram_id = ?", chatID).First(&user)
+        if userResult.Error != nil {
+                msg := tgbotapi.NewMessage(chatID, "❌ لطفاً ابتدا با /start شروع کنید")
+                mb.bot.Send(msg)
+                return
+        }
+        
+        result := mb.db.Where("owner_id = ? AND is_active = ?", user.ID, true).First(&store)
         if result.Error != nil {
                 msg := tgbotapi.NewMessage(chatID, "❌ شما هنوز فروشگاهی ثبت نکرده‌اید!")
                 mb.bot.Send(msg)
@@ -363,7 +380,7 @@ func (mb *MotherBot) showStoreManagement(chatID int64) {
 ⏰ انقضا: %s
 
 عملیات مورد نظر را انتخاب کنید:`, 
-                store.StoreName, 
+                store.Name, 
                 productCount, 
                 orderCount, 
                 store.PlanType,
