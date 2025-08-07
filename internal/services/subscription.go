@@ -3,6 +3,7 @@ package services
 import (
 	"fmt"
 	"log"
+	"telegram-store-hub/internal/messages"
 	"telegram-store-hub/internal/models"
 	"time"
 
@@ -10,284 +11,410 @@ import (
 	"gorm.io/gorm"
 )
 
+// SubscriptionService manages subscription plans and renewals
 type SubscriptionService struct {
-	db  *gorm.DB
-	bot *tgbotapi.BotAPI
+	bot               *tgbotapi.BotAPI
+	db                *gorm.DB
+	paymentCardNumber string
+	paymentCardHolder string
 }
 
-func NewSubscriptionService(db *gorm.DB) *SubscriptionService {
-	return &SubscriptionService{db: db}
+// PlanDetails contains plan information
+type PlanDetails struct {
+	Type           string `json:"type"`
+	Price          int64  `json:"price"`
+	ProductLimit   int    `json:"product_limit"`
+	CommissionRate int    `json:"commission_rate"`
+	Features       []string `json:"features"`
 }
 
-// SetBot sets the bot instance for sending notifications
-func (s *SubscriptionService) SetBot(bot *tgbotapi.BotAPI) {
-	s.bot = bot
+// SubscriptionRenewalData contains renewal information
+type SubscriptionRenewalData struct {
+	StoreID  uint   `json:"store_id"`
+	PlanType string `json:"plan_type"`
+	Price    int64  `json:"price"`
 }
 
-// CheckExpiredStores checks and handles expired stores
-func (s *SubscriptionService) CheckExpiredStores() error {
-	var expiredStores []models.Store
-	err := s.db.Where("expires_at < ? AND is_active = ?", time.Now(), true).
-		Preload("Owner").Find(&expiredStores).Error
-	if err != nil {
-		return err
+// NewSubscriptionService creates a new subscription service
+func NewSubscriptionService(
+	bot *tgbotapi.BotAPI,
+	db *gorm.DB,
+	paymentCardNumber string,
+	paymentCardHolder string,
+) *SubscriptionService {
+	return &SubscriptionService{
+		bot:               bot,
+		db:                db,
+		paymentCardNumber: paymentCardNumber,
+		paymentCardHolder: paymentCardHolder,
 	}
+}
+
+// GetAvailablePlans returns all available subscription plans
+func (s *SubscriptionService) GetAvailablePlans() []PlanDetails {
+	return []PlanDetails{
+		{
+			Type:           "free",
+			Price:          0,
+			ProductLimit:   10,
+			CommissionRate: 5,
+			Features: []string{
+				"10 محصول",
+				"کارمزد 5%",
+				"پشتیبانی عمومی",
+			},
+		},
+		{
+			Type:           "pro",
+			Price:          50000, // 50,000 Toman
+			ProductLimit:   200,
+			CommissionRate: 5,
+			Features: []string{
+				"200 محصول",
+				"کارمزد 5%",
+				"پیام خوشامدگویی",
+				"پشتیبانی اولویت‌دار",
+			},
+		},
+		{
+			Type:           "vip",
+			Price:          150000, // 150,000 Toman
+			ProductLimit:   -1,     // unlimited
+			CommissionRate: 0,
+			Features: []string{
+				"محصولات نامحدود",
+				"بدون کارمزد",
+				"ویژگی‌های اختصاصی",
+				"پشتیبانی VIP",
+				"قابلیت‌های پیشرفته",
+			},
+		},
+	}
+}
+
+// GetPlanByType returns plan details by type
+func (s *SubscriptionService) GetPlanByType(planType string) *PlanDetails {
+	plans := s.GetAvailablePlans()
+	for _, plan := range plans {
+		if plan.Type == planType {
+			return &plan
+		}
+	}
+	return nil
+}
+
+// ShowPlanRenewal displays plan renewal options
+func (s *SubscriptionService) ShowPlanRenewal(chatID int64) {
+	// Get user's store
+	store, err := s.getUserStore(chatID)
+	if err != nil {
+		msg := tgbotapi.NewMessage(chatID, messages.ErrorNoStore)
+		s.bot.Send(msg)
+		return
+	}
+
+	// Calculate remaining days
+	daysRemaining := int(time.Until(store.ExpiresAt).Hours() / 24)
+	if daysRemaining < 0 {
+		daysRemaining = 0
+	}
+
+	currentPlan := s.GetPlanByType(string(store.PlanType))
+	if currentPlan == nil {
+		msg := tgbotapi.NewMessage(chatID, messages.ErrorDatabaseError)
+		s.bot.Send(msg)
+		return
+	}
+
+	text := fmt.Sprintf(`🔄 تمدید پلن فروشگاه
+
+پلن فعلی: %s
+باقیمانده: %d روز
+
+برای تمدید پلن، یکی از گزینه‌های زیر را انتخاب کنید:`,
+		string(store.PlanType),
+		daysRemaining)
+
+	plans := s.GetAvailablePlans()
+	var keyboard [][]tgbotapi.InlineKeyboardButton
+
+	for _, plan := range plans {
+		planName := s.getPlanDisplayName(plan.Type)
+		priceText := "رایگان"
+		if plan.Price > 0 {
+			priceText = fmt.Sprintf("%s تومان", formatPrice(plan.Price))
+		}
+
+		buttonText := fmt.Sprintf("%s - %s", planName, priceText)
+		
+		keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(buttonText, fmt.Sprintf("renew_%s", plan.Type)),
+		))
+	}
+
+	keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("🔙 بازگشت", "store_settings"),
+	))
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(keyboard...)
+
+	s.bot.Send(msg)
+}
+
+// HandlePlanRenewal handles plan renewal request
+func (s *SubscriptionService) HandlePlanRenewal(chatID int64, planType string) {
+	// Get user's store
+	store, err := s.getUserStore(chatID)
+	if err != nil {
+		msg := tgbotapi.NewMessage(chatID, messages.ErrorNoStore)
+		s.bot.Send(msg)
+		return
+	}
+
+	plan := s.GetPlanByType(planType)
+	if plan == nil {
+		msg := tgbotapi.NewMessage(chatID, "❌ پلن انتخابی معتبر نیست.")
+		s.bot.Send(msg)
+		return
+	}
+
+	if plan.Price == 0 {
+		// Free plan - process immediately
+		s.ProcessPlanRenewal(store.ID, planType)
+		s.SendRenewalSuccess(chatID, planType)
+		return
+	}
+
+	// Paid plan - show payment instructions
+	s.ShowPaymentInstructions(chatID, planType, plan.Price, store.ID)
+}
+
+// ShowPaymentInstructions displays payment instructions for plan renewal
+func (s *SubscriptionService) ShowPaymentInstructions(chatID int64, planType string, price int64, storeID uint) {
+	planName := s.getPlanDisplayName(planType)
+
+	text := fmt.Sprintf(`💳 پرداخت تمدید پلن %s
+
+مبلغ قابل پرداخت: %s تومان
+
+%s
+
+%s
+
+پس از پرداخت، روی دکمه "تایید پرداخت" کلیک کنید.`,
+		planName,
+		formatPrice(price),
+		fmt.Sprintf(messages.PaymentCardInfo, s.paymentCardNumber, s.paymentCardHolder, formatPrice(price)),
+		messages.PaymentInstructions)
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("✅ تایید پرداخت", fmt.Sprintf("confirm_renewal_%s_%d", planType, storeID)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔙 بازگشت", "renew_plan"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = keyboard
+
+	s.bot.Send(msg)
+}
+
+// ProcessPlanRenewal processes the plan renewal
+func (s *SubscriptionService) ProcessPlanRenewal(storeID uint, planType string) error {
+	plan := s.GetPlanByType(planType)
+	if plan == nil {
+		return fmt.Errorf("invalid plan type: %s", planType)
+	}
+
+	// Update store with new plan
+	updates := map[string]interface{}{
+		"plan_type":       models.PlanType(planType),
+		"product_limit":   plan.ProductLimit,
+		"commission_rate": plan.CommissionRate,
+		"is_active":       true,
+		"expires_at":      time.Now().AddDate(0, 1, 0), // Extend by 1 month
+		"updated_at":      time.Now(),
+	}
+
+	if err := s.db.Model(&models.Store{}).Where("id = ?", storeID).Updates(updates).Error; err != nil {
+		return fmt.Errorf("failed to update store plan: %w", err)
+	}
+
+	log.Printf("Plan renewed for store %d to %s", storeID, planType)
+	return nil
+}
+
+// SendRenewalSuccess sends renewal success message
+func (s *SubscriptionService) SendRenewalSuccess(chatID int64, planType string) {
+	planName := s.getPlanDisplayName(planType)
+	plan := s.GetPlanByType(planType)
+
+	text := fmt.Sprintf(`🎉 تبریک! پلن شما با موفقیت تمدید شد!
+
+📋 اطلاعات پلن جدید:
+• نوع: %s
+• محصولات مجاز: %s
+• کارمزد: %d%%
+• مدت اعتبار: 1 ماه
+
+✨ ویژگی‌های پلن:
+%s`,
+		planName,
+		func() string {
+			if plan.ProductLimit == -1 {
+				return "نامحدود"
+			}
+			return fmt.Sprintf("%d", plan.ProductLimit)
+		}(),
+		plan.CommissionRate,
+		s.formatFeatures(plan.Features))
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🏪 پنل مدیریت", "manage_store"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🏠 منوی اصلی", "back_main"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = keyboard
+
+	s.bot.Send(msg)
+}
+
+// CheckExpiringSubscriptions checks for expiring subscriptions and sends reminders
+func (s *SubscriptionService) CheckExpiringSubscriptions() {
+	reminderDays := []int{7, 3, 1} // Remind 7, 3, and 1 days before expiry
+
+	for _, days := range reminderDays {
+		reminderDate := time.Now().AddDate(0, 0, days)
+		
+		var stores []models.Store
+		err := s.db.Preload("Owner").Where("expires_at::date = ? AND is_active = ?", reminderDate.Format("2006-01-02"), true).Find(&stores).Error
+		if err != nil {
+			log.Printf("Error finding expiring stores: %v", err)
+			continue
+		}
+
+		for _, store := range stores {
+			s.SendExpiryReminder(store.Owner.TelegramID, &store, days)
+		}
+	}
+}
+
+// SendExpiryReminder sends subscription expiry reminder
+func (s *SubscriptionService) SendExpiryReminder(chatID int64, store *models.Store, daysRemaining int) {
+	var text string
 	
+	if daysRemaining == 1 {
+		text = fmt.Sprintf(`⚠️ هشدار! پلن فروشگاه "%s" فردا منقضی می‌شود!
+
+برای جلوگیری از قطع سرویس، همین حالا پلن خود را تمدید کنید.`, store.Name)
+	} else {
+		text = fmt.Sprintf(`⏰ یادآوری: پلن فروشگاه "%s" %d روز دیگر منقضی می‌شود.
+
+برای تمدید پلن روی دکمه زیر کلیک کنید.`, store.Name, daysRemaining)
+	}
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔄 تمدید پلن", "renew_plan"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🏪 پنل مدیریت", "manage_store"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = keyboard
+
+	s.bot.Send(msg)
+}
+
+// DeactivateExpiredSubscriptions deactivates expired subscriptions
+func (s *SubscriptionService) DeactivateExpiredSubscriptions() {
+	yesterday := time.Now().AddDate(0, 0, -1)
+	
+	var expiredStores []models.Store
+	err := s.db.Preload("Owner").Where("expires_at < ? AND is_active = ?", yesterday, true).Find(&expiredStores).Error
+	if err != nil {
+		log.Printf("Error finding expired stores: %v", err)
+		return
+	}
+
 	for _, store := range expiredStores {
 		// Deactivate store
 		s.db.Model(&store).Update("is_active", false)
 		
-		// Send notification to owner
-		if s.bot != nil {
-			s.sendExpirationNotification(store)
-		}
+		// Send expiry notification
+		s.SendExpiryNotification(store.Owner.TelegramID, &store)
 		
-		log.Printf("Store %s (ID: %d) has been deactivated due to expiration", store.Name, store.ID)
-	}
-	
-	return nil
-}
-
-// CheckExpiringSoonStores checks stores expiring within specified days and sends reminders
-func (s *SubscriptionService) CheckExpiringSoonStores(days int) error {
-	endDate := time.Now().AddDate(0, 0, days)
-	
-	var expiringSoonStores []models.Store
-	err := s.db.Where("expires_at BETWEEN ? AND ? AND is_active = ?", time.Now(), endDate, true).
-		Preload("Owner").Find(&expiringSoonStores).Error
-	if err != nil {
-		return err
-	}
-	
-	for _, store := range expiringSoonStores {
-		// Send reminder notification
-		if s.bot != nil {
-			s.sendExpirationReminder(store, days)
-		}
-		
-		log.Printf("Sent expiration reminder for store %s (ID: %d)", store.Name, store.ID)
-	}
-	
-	return nil
-}
-
-// UpgradeStorePlan upgrades a store to a higher plan
-func (s *SubscriptionService) UpgradeStorePlan(storeID uint, newPlan models.PlanType, months int) error {
-	var store models.Store
-	if err := s.db.First(&store, storeID).Error; err != nil {
-		return err
-	}
-	
-	// Update plan details
-	var productLimit, commissionRate int
-	switch newPlan {
-	case models.PlanFree:
-		productLimit = 10
-		commissionRate = 5
-	case models.PlanPro:
-		productLimit = 200
-		commissionRate = 5
-	case models.PlanVIP:
-		productLimit = -1 // unlimited
-		commissionRate = 0
-	}
-	
-	// Calculate new expiry date
-	baseTime := time.Now()
-	if store.ExpiresAt.After(time.Now()) {
-		baseTime = store.ExpiresAt
-	}
-	newExpiryDate := baseTime.AddDate(0, months, 0)
-	
-	// Update store
-	updates := map[string]interface{}{
-		"plan_type":       newPlan,
-		"product_limit":   productLimit,
-		"commission_rate": commissionRate,
-		"expires_at":      newExpiryDate,
-		"is_active":       true,
-	}
-	
-	return s.db.Model(&store).Updates(updates).Error
-}
-
-// RenewStorePlan renews a store plan for specified months
-func (s *SubscriptionService) RenewStorePlan(storeID uint, months int) error {
-	var store models.Store
-	if err := s.db.First(&store, storeID).Error; err != nil {
-		return err
-	}
-	
-	// Calculate new expiry date
-	baseTime := store.ExpiresAt
-	if time.Now().After(store.ExpiresAt) {
-		baseTime = time.Now()
-	}
-	newExpiryDate := baseTime.AddDate(0, months, 0)
-	
-	// Update store
-	updates := map[string]interface{}{
-		"expires_at": newExpiryDate,
-		"is_active":  true,
-	}
-	
-	return s.db.Model(&store).Updates(updates).Error
-}
-
-// GetPlanLimits returns the limits for a specific plan
-func (s *SubscriptionService) GetPlanLimits(planType models.PlanType) map[string]interface{} {
-	switch planType {
-	case models.PlanFree:
-		return map[string]interface{}{
-			"product_limit":   10,
-			"commission_rate": 5,
-			"features": []string{
-				"حداکثر ۱۰ محصول",
-				"دکمه‌های ثابت",
-				"پشتیبانی پایه",
-			},
-		}
-	case models.PlanPro:
-		return map[string]interface{}{
-			"product_limit":   200,
-			"commission_rate": 5,
-			"features": []string{
-				"تا ۲۰۰ محصول",
-				"گزارش‌های پیشرفته",
-				"پیام خوش‌آمدگویی",
-				"تبلیغات دلخواه",
-				"پشتیبانی اولویت‌دار",
-			},
-		}
-	case models.PlanVIP:
-		return map[string]interface{}{
-			"product_limit":   -1, // unlimited
-			"commission_rate": 0,
-			"features": []string{
-				"محصولات نامحدود",
-				"درگاه پرداخت اختصاصی",
-				"بدون کارمزد",
-				"تبلیغات ویژه",
-				"دکمه‌های شخصی‌سازی شده",
-				"پشتیبانی ۲۴/۷",
-			},
-		}
-	default:
-		return map[string]interface{}{}
+		log.Printf("Deactivated expired store: %s (ID: %d)", store.Name, store.ID)
 	}
 }
 
-// GetPlanPrice returns the price for a specific plan
-func (s *SubscriptionService) GetPlanPrice(planType models.PlanType) int64 {
-	switch planType {
-	case models.PlanFree:
-		return 0
-	case models.PlanPro:
-		return 50000 // 50,000 Toman per month
-	case models.PlanVIP:
-		return 150000 // 150,000 Toman per month
-	default:
-		return 0
-	}
-}
+// SendExpiryNotification sends subscription expired notification
+func (s *SubscriptionService) SendExpiryNotification(chatID int64, store *models.Store) {
+	text := fmt.Sprintf(`❌ پلن فروشگاه "%s" منقضی شده است!
 
-// GetSubscriptionStats gets subscription statistics
-func (s *SubscriptionService) GetSubscriptionStats() (map[string]interface{}, error) {
-	var freeCount, proCount, vipCount, activeCount, expiredCount int64
-	
-	s.db.Model(&models.Store{}).Where("plan_type = ?", models.PlanFree).Count(&freeCount)
-	s.db.Model(&models.Store{}).Where("plan_type = ?", models.PlanPro).Count(&proCount)
-	s.db.Model(&models.Store{}).Where("plan_type = ?", models.PlanVIP).Count(&vipCount)
-	s.db.Model(&models.Store{}).Where("is_active = ?", true).Count(&activeCount)
-	s.db.Model(&models.Store{}).Where("expires_at < ?", time.Now()).Count(&expiredCount)
-	
-	return map[string]interface{}{
-		"free_stores":    freeCount,
-		"pro_stores":     proCount,
-		"vip_stores":     vipCount,
-		"active_stores":  activeCount,
-		"expired_stores": expiredCount,
-	}, nil
-}
+فروشگاه شما غیرفعال شده و مشتریان نمی‌توانند سفارش ثبت کنند.
 
-// sendExpirationNotification sends notification when store expires
-func (s *SubscriptionService) sendExpirationNotification(store models.Store) {
-	text := fmt.Sprintf(`⚠️ پلن فروشگاه شما منقضی شد
+برای فعال‌سازی مجدد، پلن خود را تمدید کنید.`, store.Name)
 
-🏪 فروشگاه: %s
-📅 تاریخ انقضا: %s
-
-❌ فروشگاه شما غیرفعال شده است
-💡 برای فعال‌سازی مجدد، پلن خود را تمدید کنید`, 
-		store.Name,
-		store.ExpiresAt.Format("2006/01/02"))
-	
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🔄 تمدید پلن", fmt.Sprintf("renew_plan_%d", store.ID)),
+			tgbotapi.NewInlineKeyboardButtonData("🔄 تمدید پلن", "renew_plan"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("📞 پشتیبانی", "support"),
+			tgbotapi.NewInlineKeyboardButtonData("🏠 منوی اصلی", "back_main"),
 		),
 	)
-	
-	msg := tgbotapi.NewMessage(store.Owner.TelegramID, text)
+
+	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ReplyMarkup = keyboard
-	
+
 	s.bot.Send(msg)
 }
 
-// sendExpirationReminder sends reminder before expiration
-func (s *SubscriptionService) sendExpirationReminder(store models.Store, daysLeft int) {
-	text := fmt.Sprintf(`🔔 یادآوری تمدید پلن
+// Helper methods
 
-🏪 فروشگاه: %s
-⏰ روزهای باقی‌مانده: %d روز
-📅 تاریخ انقضا: %s
+func (s *SubscriptionService) getUserStore(chatID int64) (*models.Store, error) {
+	var user models.User
+	if err := s.db.Where("telegram_id = ?", chatID).First(&user).Error; err != nil {
+		return nil, err
+	}
 
-💡 برای جلوگیری از قطع سرویس، پلن خود را هرچه سریع‌تر تمدید کنید`, 
-		store.Name,
-		daysLeft,
-		store.ExpiresAt.Format("2006/01/02"))
-	
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🔄 تمدید پلن", fmt.Sprintf("renew_plan_%d", store.ID)),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("📊 پنل فروشگاه", fmt.Sprintf("manage_store_%d", store.ID)),
-		),
-	)
-	
-	msg := tgbotapi.NewMessage(store.Owner.TelegramID, text)
-	msg.ReplyMarkup = keyboard
-	
-	s.bot.Send(msg)
+	var store models.Store
+	if err := s.db.Where("owner_id = ?", user.ID).First(&store).Error; err != nil {
+		return nil, err
+	}
+
+	return &store, nil
 }
 
-// StartSubscriptionChecker starts a goroutine to periodically check subscriptions
-func (s *SubscriptionService) StartSubscriptionChecker() {
-	go func() {
-		ticker := time.NewTicker(24 * time.Hour) // Check daily
-		defer ticker.Stop()
-		
-		for range ticker.C {
-			// Check expired stores
-			if err := s.CheckExpiredStores(); err != nil {
-				log.Printf("Error checking expired stores: %v", err)
-			}
-			
-			// Check stores expiring in 3 days
-			if err := s.CheckExpiringSoonStores(3); err != nil {
-				log.Printf("Error checking expiring stores: %v", err)
-			}
-			
-			// Check stores expiring in 7 days
-			if err := s.CheckExpiringSoonStores(7); err != nil {
-				log.Printf("Error checking expiring stores (7 days): %v", err)
-			}
-		}
-	}()
-	
-	log.Println("✅ Subscription checker started")
+func (s *SubscriptionService) getPlanDisplayName(planType string) string {
+	switch planType {
+	case "free":
+		return "رایگان"
+	case "pro":
+		return "حرفه‌ای"
+	case "vip":
+		return "ویژه"
+	default:
+		return planType
+	}
+}
+
+func (s *SubscriptionService) formatFeatures(features []string) string {
+	result := ""
+	for _, feature := range features {
+		result += "• " + feature + "\n"
+	}
+	return result
 }

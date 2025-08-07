@@ -4,390 +4,370 @@ import (
 	"fmt"
 	"log"
 	"telegram-store-hub/internal/models"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"gorm.io/gorm"
 )
 
+// BotManagerService manages automatic sub-bot creation and management
 type BotManagerService struct {
-	db           *gorm.DB
-	activeBots   map[uint]*tgbotapi.BotAPI // store_id -> bot instance
-	runningBots  map[uint]chan struct{}    // store_id -> stop channel
+	bot *tgbotapi.BotAPI
+	db  *gorm.DB
 }
 
-func NewBotManagerService(db *gorm.DB) *BotManagerService {
+// SubBotConfig contains configuration for creating sub-bots
+type SubBotConfig struct {
+	StoreID     uint   `json:"store_id"`
+	StoreName   string `json:"store_name"`
+	Description string `json:"description"`
+	PlanType    string `json:"plan_type"`
+	OwnerID     uint   `json:"owner_id"`
+}
+
+// BotStatus represents the status of a bot
+type BotStatus string
+
+const (
+	BotStatusCreating BotStatus = "creating"
+	BotStatusActive   BotStatus = "active"
+	BotStatusInactive BotStatus = "inactive"
+	BotStatusError    BotStatus = "error"
+)
+
+// NewBotManagerService creates a new bot manager service
+func NewBotManagerService(bot *tgbotapi.BotAPI, db *gorm.DB) *BotManagerService {
 	return &BotManagerService{
-		db:          db,
-		activeBots:  make(map[uint]*tgbotapi.BotAPI),
-		runningBots: make(map[uint]chan struct{}),
+		bot: bot,
+		db:  db,
 	}
 }
 
-// StartAllBots starts all active store bots
-func (s *BotManagerService) StartAllBots() error {
-	var stores []models.Store
-	err := s.db.Where("is_active = ? AND bot_token != ''", true).Find(&stores).Error
-	if err != nil {
-		return err
-	}
-	
-	for _, store := range stores {
-		if err := s.StartStoreBot(store.ID); err != nil {
-			log.Printf("Failed to start bot for store %d: %v", store.ID, err)
-		}
-	}
-	
-	return nil
-}
-
-// StartStoreBot starts a bot for a specific store
-func (s *BotManagerService) StartStoreBot(storeID uint) error {
-	var store models.Store
-	if err := s.db.First(&store, storeID).Error; err != nil {
-		return err
-	}
-	
-	if store.BotToken == "" {
-		return fmt.Errorf("bot token not set for store %d", storeID)
-	}
-	
-	// Check if bot is already running
-	if _, exists := s.runningBots[storeID]; exists {
-		return fmt.Errorf("bot already running for store %d", storeID)
-	}
-	
-	bot, err := tgbotapi.NewBotAPI(store.BotToken)
-	if err != nil {
-		return err
-	}
-	
-	bot.Debug = false
-	s.activeBots[storeID] = bot
-	
-	// Create stop channel
-	stopChan := make(chan struct{})
-	s.runningBots[storeID] = stopChan
-	
-	// Start bot in goroutine
-	go s.runStoreBot(storeID, bot, stopChan)
-	
-	log.Printf("Started bot for store %d (@%s)", storeID, bot.Self.UserName)
-	return nil
-}
-
-// StopStoreBot stops a bot for a specific store
-func (s *BotManagerService) StopStoreBot(storeID uint) error {
-	stopChan, exists := s.runningBots[storeID]
-	if !exists {
-		return fmt.Errorf("no running bot found for store %d", storeID)
-	}
-	
-	// Signal to stop
-	close(stopChan)
-	
-	// Clean up
-	delete(s.activeBots, storeID)
-	delete(s.runningBots, storeID)
-	
-	log.Printf("Stopped bot for store %d", storeID)
-	return nil
-}
-
-// StopAllBots stops all running bots
-func (s *BotManagerService) StopAllBots() {
-	for storeID := range s.runningBots {
-		s.StopStoreBot(storeID)
-	}
-}
-
-// RestartStoreBot restarts a bot for a specific store
-func (s *BotManagerService) RestartStoreBot(storeID uint) error {
-	// Stop if running
-	if _, exists := s.runningBots[storeID]; exists {
-		if err := s.StopStoreBot(storeID); err != nil {
-			return err
-		}
-	}
-	
-	// Start again
-	return s.StartStoreBot(storeID)
-}
-
-// UpdateStoreBotToken updates bot token for a store and restarts bot
-func (s *BotManagerService) UpdateStoreBotToken(storeID uint, token string) error {
-	// Update token in database
-	if err := s.db.Model(&models.Store{}).Where("id = ?", storeID).Update("bot_token", token).Error; err != nil {
-		return err
-	}
-	
-	// Restart bot with new token
-	return s.RestartStoreBot(storeID)
-}
-
-// runStoreBot runs the store bot loop
-func (s *BotManagerService) runStoreBot(storeID uint, bot *tgbotapi.BotAPI, stopChan chan struct{}) {
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-	
-	updates := bot.GetUpdatesChan(u)
-	
-	for {
-		select {
-		case <-stopChan:
-			bot.StopReceivingUpdates()
-			return
-		case update := <-updates:
-			// Handle store bot updates
-			s.handleStoreBotUpdate(storeID, bot, update)
-		}
-	}
-}
-
-// handleStoreBotUpdate handles updates for store bots
-func (s *BotManagerService) handleStoreBotUpdate(storeID uint, bot *tgbotapi.BotAPI, update tgbotapi.Update) {
+// CreateSubBot creates a new sub-bot for a store
+func (b *BotManagerService) CreateSubBot(storeID uint) error {
 	// Get store information
 	var store models.Store
-	if err := s.db.Preload("Owner").Preload("Products").First(&store, storeID).Error; err != nil {
-		log.Printf("Error getting store %d: %v", storeID, err)
+	if err := b.db.Preload("Owner").First(&store, storeID).Error; err != nil {
+		return fmt.Errorf("failed to get store: %w", err)
+	}
+
+	log.Printf("Creating sub-bot for store: %s (ID: %d)", store.Name, store.ID)
+
+	// Update store status to indicate bot creation is in progress
+	if err := b.db.Model(&store).Updates(map[string]interface{}{
+		"bot_status": BotStatusCreating,
+		"updated_at": time.Now(),
+	}).Error; err != nil {
+		return fmt.Errorf("failed to update store status: %w", err)
+	}
+
+	// Start async bot creation process
+	go b.createSubBotAsync(&store)
+
+	return nil
+}
+
+// createSubBotAsync creates sub-bot asynchronously
+func (b *BotManagerService) createSubBotAsync(store *models.Store) {
+	// Generate unique bot username
+	botUsername := b.generateBotUsername(store.Name, store.ID)
+	
+	// Simulate bot creation process (in real implementation, this would involve BotFather API)
+	log.Printf("Simulating bot creation for store: %s", store.Name)
+	time.Sleep(2 * time.Second) // Simulate creation delay
+
+	// Generate fake bot token for demonstration
+	botToken := b.generateFakeBotToken(store.ID)
+
+	// Create bot configuration
+	config := &SubBotConfig{
+		StoreID:     store.ID,
+		StoreName:   store.Name,
+		Description: store.Description,
+		PlanType:    string(store.PlanType),
+		OwnerID:     store.OwnerID,
+	}
+
+	// Update store with bot information
+	updates := map[string]interface{}{
+		"bot_username": botUsername,
+		"bot_token":    botToken, // In real implementation, encrypt this
+		"bot_status":   BotStatusActive,
+		"updated_at":   time.Now(),
+	}
+
+	if err := b.db.Model(store).Updates(updates).Error; err != nil {
+		log.Printf("Failed to update store with bot info: %v", err)
+		b.handleBotCreationError(store.ID, err)
 		return
 	}
-	
-	// Check if store is active
-	if !store.IsActive {
-		// Send inactive message if someone tries to use the bot
-		if update.Message != nil {
-			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "❌ این فروشگاه در حال حاضر غیرفعال است")
-			bot.Send(msg)
-		}
+
+	// Initialize bot settings
+	if err := b.initializeBotSettings(store.ID, config); err != nil {
+		log.Printf("Failed to initialize bot settings: %v", err)
+		b.handleBotCreationError(store.ID, err)
 		return
 	}
-	
-	if update.Message != nil {
-		s.handleStoreBotMessage(store, bot, update.Message)
-	} else if update.CallbackQuery != nil {
-		s.handleStoreBotCallback(store, bot, update.CallbackQuery)
-	}
+
+	// Send notification to store owner
+	b.notifyBotCreated(store.Owner.TelegramID, store, botUsername)
+
+	log.Printf("Sub-bot created successfully for store %s: @%s", store.Name, botUsername)
 }
 
-// handleStoreBotMessage handles text messages for store bots
-func (s *BotManagerService) handleStoreBotMessage(store models.Store, bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
-	chatID := message.Chat.ID
-	text := message.Text
+// generateBotUsername generates a unique bot username
+func (b *BotManagerService) generateBotUsername(storeName string, storeID uint) string {
+	// Clean store name for username (remove spaces, special chars)
+	cleanName := b.cleanStringForUsername(storeName)
 	
-	switch text {
-	case "/start":
-		s.sendStoreWelcome(store, bot, chatID)
-	case "/products", "📦 محصولات":
-		s.sendStoreProducts(store, bot, chatID)
-	case "/contact", "📞 تماس":
-		s.sendStoreContact(store, bot, chatID)
-	case "/help", "ℹ️ راهنما":
-		s.sendStoreHelp(store, bot, chatID)
-	default:
-		s.sendStoreWelcome(store, bot, chatID)
-	}
+	// Ensure uniqueness by adding store ID
+	return fmt.Sprintf("%s_%d_bot", cleanName, storeID)
 }
 
-// handleStoreBotCallback handles callback queries for store bots
-func (s *BotManagerService) handleStoreBotCallback(store models.Store, bot *tgbotapi.BotAPI, callback *tgbotapi.CallbackQuery) {
-	chatID := callback.Message.Chat.ID
-	data := callback.Data
-	
-	// Answer callback query
-	bot.Request(tgbotapi.NewCallback(callback.ID, ""))
-	
-	// Handle different callback types
-	switch {
-	case data == "view_products":
-		s.sendStoreProducts(store, bot, chatID)
-	case data == "contact_store":
-		s.sendStoreContact(store, bot, chatID)
-	case data == "store_info":
-		s.sendStoreInfo(store, bot, chatID)
-	}
+// generateFakeBotToken generates a fake bot token for demonstration
+func (b *BotManagerService) generateFakeBotToken(storeID uint) string {
+	// In real implementation, this would be obtained from BotFather
+	return fmt.Sprintf("fake_token_%d_%d", storeID, time.Now().Unix())
 }
 
-// sendStoreWelcome sends welcome message for store bot
-func (s *BotManagerService) sendStoreWelcome(store models.Store, bot *tgbotapi.BotAPI, chatID int64) {
-	welcomeText := store.WelcomeMessage
-	if welcomeText == "" {
-		welcomeText = fmt.Sprintf(`🛍 به فروشگاه %s خوش آمدید!
-
-%s
-
-برای مشاهده محصولات و خرید، از دکمه‌های زیر استفاده کنید:`, store.Name, store.Description)
-	}
-	
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("📦 مشاهده محصولات", "view_products"),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("📞 تماس با فروشگاه", "contact_store"),
-			tgbotapi.NewInlineKeyboardButtonData("ℹ️ درباره فروشگاه", "store_info"),
-		),
-	)
-	
-	msg := tgbotapi.NewMessage(chatID, welcomeText)
-	msg.ReplyMarkup = keyboard
-	bot.Send(msg)
-}
-
-// sendStoreProducts sends list of store products
-func (s *BotManagerService) sendStoreProducts(store models.Store, bot *tgbotapi.BotAPI, chatID int64) {
-	products, err := s.getActiveStoreProducts(store.ID)
-	if err != nil || len(products) == 0 {
-		msg := tgbotapi.NewMessage(chatID, "❌ در حال حاضر محصولی موجود نیست")
-		bot.Send(msg)
-		return
-	}
-	
-	text := fmt.Sprintf("📦 محصولات فروشگاه %s:\n\n", store.Name)
-	keyboard := tgbotapi.NewInlineKeyboardMarkup()
-	
-	for _, product := range products {
-		text += fmt.Sprintf("🔹 %s\n", product.Name)
-		text += fmt.Sprintf("💰 قیمت: %s تومان\n", s.formatPrice(product.Price))
-		text += fmt.Sprintf("📝 %s\n\n", product.Description)
-		
-		// Add product button
-		row := tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData(
-				fmt.Sprintf("🛒 خرید %s", product.Name),
-				fmt.Sprintf("buy_%d", product.ID)),
-		)
-		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, row)
-	}
-	
-	// Add back button
-	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard,
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🔙 بازگشت", "back_main"),
-		))
-	
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ReplyMarkup = keyboard
-	bot.Send(msg)
-}
-
-// sendStoreContact sends store contact information
-func (s *BotManagerService) sendStoreContact(store models.Store, bot *tgbotapi.BotAPI, chatID int64) {
-	contactText := store.SupportContact
-	if contactText == "" {
-		contactText = fmt.Sprintf(`📞 اطلاعات تماس فروشگاه %s:
-
-👤 نام فروشنده: %s %s
-📱 تلگرام: @%s
-
-برای سفارش و پشتیبانی با ما در ارتباط باشید.`, 
-			store.Name,
-			store.Owner.FirstName,
-			store.Owner.LastName,
-			store.Owner.Username)
-	}
-	
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🔙 بازگشت", "back_main"),
-		),
-	)
-	
-	msg := tgbotapi.NewMessage(chatID, contactText)
-	msg.ReplyMarkup = keyboard
-	bot.Send(msg)
-}
-
-// sendStoreInfo sends store information
-func (s *BotManagerService) sendStoreInfo(store models.Store, bot *tgbotapi.BotAPI, chatID int64) {
-	text := fmt.Sprintf(`ℹ️ درباره فروشگاه %s:
-
-📋 توضیحات:
-%s
-
-📊 آمار:
-🏪 نام فروشگاه: %s
-📦 تعداد محصولات: %d
-📅 تاریخ شروع: %s
-💎 سطح خدمات: %s`, 
-		store.Name,
-		store.Description,
-		store.Name,
-		len(store.Products),
-		store.CreatedAt.Format("2006/01/02"),
-		string(store.PlanType))
-	
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🔙 بازگشت", "back_main"),
-		),
-	)
-	
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ReplyMarkup = keyboard
-	bot.Send(msg)
-}
-
-// sendStoreHelp sends help message
-func (s *BotManagerService) sendStoreHelp(store models.Store, bot *tgbotapi.BotAPI, chatID int64) {
-	text := `ℹ️ راهنمای استفاده:
-
-📦 /products - مشاهده محصولات
-📞 /contact - اطلاعات تماس
-🏪 /start - صفحه اصلی
-ℹ️ /help - راهنما
-
-برای خرید محصولات، از بخش محصولات استفاده کنید.`
-	
-	msg := tgbotapi.NewMessage(chatID, text)
-	bot.Send(msg)
-}
-
-// Helper functions
-func (s *BotManagerService) getActiveStoreProducts(storeID uint) ([]models.Product, error) {
-	var products []models.Product
-	err := s.db.Where("store_id = ? AND is_available = ?", storeID, true).Find(&products).Error
-	return products, err
-}
-
-func (s *BotManagerService) formatPrice(price int64) string {
-	// Convert to string with thousands separator
-	priceStr := fmt.Sprintf("%d", price)
-	if len(priceStr) > 3 {
-		// Add comma separators
-		formatted := ""
-		for i, digit := range priceStr {
-			if i > 0 && (len(priceStr)-i)%3 == 0 {
-				formatted += ","
-			}
-			formatted += string(digit)
+// cleanStringForUsername cleans a string to make it suitable for username
+func (b *BotManagerService) cleanStringForUsername(s string) string {
+	// Replace spaces and special characters with underscores
+	result := ""
+	for _, char := range s {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') {
+			result += string(char)
+		} else if char == ' ' || char == '-' {
+			result += "_"
 		}
-		return formatted
 	}
-	return priceStr
-}
-
-// GetBotStatus returns status of all bots
-func (s *BotManagerService) GetBotStatus() map[string]interface{} {
-	return map[string]interface{}{
-		"active_bots":  len(s.activeBots),
-		"running_bots": len(s.runningBots),
-		"store_bots":   s.getStoreBotsList(),
-	}
-}
-
-func (s *BotManagerService) getStoreBotsList() []map[string]interface{} {
-	var result []map[string]interface{}
 	
-	for storeID := range s.runningBots {
-		var store models.Store
-		if err := s.db.First(&store, storeID).Error; err == nil {
-			result = append(result, map[string]interface{}{
-				"store_id":   storeID,
-				"store_name": store.Name,
-				"is_active":  store.IsActive,
-			})
-		}
+	// Limit length to 20 characters
+	if len(result) > 20 {
+		result = result[:20]
 	}
 	
 	return result
+}
+
+// initializeBotSettings initializes settings for the new bot
+func (b *BotManagerService) initializeBotSettings(storeID uint, config *SubBotConfig) error {
+	// In a real implementation, this would:
+	// 1. Set bot description and about text
+	// 2. Configure bot commands
+	// 3. Set up webhooks
+	// 4. Initialize bot database tables
+	// 5. Configure payment settings
+	// 6. Set up welcome messages based on plan type
+
+	log.Printf("Initializing bot settings for store %d", storeID)
+
+	// Simulate initialization delay
+	time.Sleep(1 * time.Second)
+
+	// Here you would configure the bot based on the plan type
+	switch config.PlanType {
+	case "free":
+		// Configure free plan features
+		log.Printf("Configuring free plan features for store %d", storeID)
+	case "pro":
+		// Configure pro plan features (welcome message, etc.)
+		log.Printf("Configuring pro plan features for store %d", storeID)
+	case "vip":
+		// Configure VIP plan features (custom features, etc.)
+		log.Printf("Configuring VIP plan features for store %d", storeID)
+	}
+
+	return nil
+}
+
+// handleBotCreationError handles errors during bot creation
+func (b *BotManagerService) handleBotCreationError(storeID uint, err error) {
+	log.Printf("Bot creation failed for store %d: %v", storeID, err)
+
+	// Update store status to error
+	b.db.Model(&models.Store{}).Where("id = ?", storeID).Updates(map[string]interface{}{
+		"bot_status": BotStatusError,
+		"updated_at": time.Now(),
+	})
+
+	// Notify store owner about the error
+	var store models.Store
+	if err := b.db.Preload("Owner").First(&store, storeID).Error; err == nil {
+		b.notifyBotCreationError(store.Owner.TelegramID, &store, err)
+	}
+}
+
+// notifyBotCreated sends notification when bot is successfully created
+func (b *BotManagerService) notifyBotCreated(ownerTelegramID int64, store *models.Store, botUsername string) {
+	text := fmt.Sprintf(`🤖 ربات فروشگاه شما آماده شد!
+
+🏪 فروشگاه: %s
+🤖 ربات: @%s
+
+✅ ربات شما با موفقیت ایجاد و پیکربندی شد!
+
+🔗 لینک ربات: https://t.me/%s
+
+اکنون مشتریان می‌توانند از طریق این ربات محصولات شما را مشاهده و خریداری کنند.
+
+💡 نکته: ربات فعلاً در حالت آزمایشی است. برای فعال‌سازی کامل، با پشتیبانی تماس بگیرید.`,
+		store.Name,
+		botUsername,
+		botUsername)
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonURL("🔗 باز کردن ربات", fmt.Sprintf("https://t.me/%s", botUsername)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🏪 پنل مدیریت", "manage_store"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(ownerTelegramID, text)
+	msg.ReplyMarkup = keyboard
+
+	b.bot.Send(msg)
+}
+
+// notifyBotCreationError sends notification when bot creation fails
+func (b *BotManagerService) notifyBotCreationError(ownerTelegramID int64, store *models.Store, err error) {
+	text := fmt.Sprintf(`❌ خطا در ایجاد ربات فروشگاه
+
+🏪 فروشگاه: %s
+
+متأسفانه در ایجاد ربات فروشگاه شما خطایی رخ داده است.
+
+🔄 ما در حال بررسی و رفع مشکل هستیم.
+
+💬 در صورت ادامه مشکل، با پشتیبانی تماس بگیرید.`,
+		store.Name)
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔄 تلاش مجدد", "retry_bot_creation"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("💬 پشتیبانی", "support"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(ownerTelegramID, text)
+	msg.ReplyMarkup = keyboard
+
+	b.bot.Send(msg)
+}
+
+// RetryBotCreation retries bot creation for a store
+func (b *BotManagerService) RetryBotCreation(storeID uint) error {
+	log.Printf("Retrying bot creation for store %d", storeID)
+	return b.CreateSubBot(storeID)
+}
+
+// DeactivateBot deactivates a store's bot
+func (b *BotManagerService) DeactivateBot(storeID uint) error {
+	// Update store status
+	if err := b.db.Model(&models.Store{}).Where("id = ?", storeID).Updates(map[string]interface{}{
+		"bot_status": BotStatusInactive,
+		"updated_at": time.Now(),
+	}).Error; err != nil {
+		return fmt.Errorf("failed to deactivate bot: %w", err)
+	}
+
+	log.Printf("Bot deactivated for store %d", storeID)
+	return nil
+}
+
+// ReactivateBot reactivates a store's bot
+func (b *BotManagerService) ReactivateBot(storeID uint) error {
+	// Update store status
+	if err := b.db.Model(&models.Store{}).Where("id = ?", storeID).Updates(map[string]interface{}{
+		"bot_status": BotStatusActive,
+		"updated_at": time.Now(),
+	}).Error; err != nil {
+		return fmt.Errorf("failed to reactivate bot: %w", err)
+	}
+
+	log.Printf("Bot reactivated for store %d", storeID)
+	return nil
+}
+
+// GetBotStatus returns the status of a store's bot
+func (b *BotManagerService) GetBotStatus(storeID uint) (BotStatus, error) {
+	var store models.Store
+	if err := b.db.Select("bot_status").First(&store, storeID).Error; err != nil {
+		return "", fmt.Errorf("failed to get store: %w", err)
+	}
+
+	return BotStatus(store.BotStatus), nil
+}
+
+// GetStoreBots returns all bots with their status
+func (b *BotManagerService) GetStoreBots() ([]models.Store, error) {
+	var stores []models.Store
+	if err := b.db.Preload("Owner").Where("bot_username IS NOT NULL").Find(&stores).Error; err != nil {
+		return nil, fmt.Errorf("failed to get store bots: %w", err)
+	}
+
+	return stores, nil
+}
+
+// UpdateBotConfiguration updates bot configuration based on plan changes
+func (b *BotManagerService) UpdateBotConfiguration(storeID uint, newPlanType string) error {
+	log.Printf("Updating bot configuration for store %d to plan %s", storeID, newPlanType)
+
+	// In a real implementation, this would:
+	// 1. Update bot features based on new plan
+	// 2. Enable/disable certain commands
+	// 3. Update welcome messages
+	// 4. Modify payment settings
+	// 5. Update commission rates
+
+	// Simulate configuration update
+	time.Sleep(500 * time.Millisecond)
+
+	log.Printf("Bot configuration updated for store %d", storeID)
+	return nil
+}
+
+// MonitorBots monitors all bots and ensures they're running properly
+func (b *BotManagerService) MonitorBots() {
+	log.Println("Starting bot monitoring routine...")
+
+	// Get all active bots
+	var stores []models.Store
+	if err := b.db.Where("bot_status = ?", BotStatusActive).Find(&stores).Error; err != nil {
+		log.Printf("Error getting active bots: %v", err)
+		return
+	}
+
+	for _, store := range stores {
+		// In a real implementation, this would:
+		// 1. Check if bot is responding
+		// 2. Verify bot configuration
+		// 3. Check for errors or issues
+		// 4. Update bot status if needed
+
+		log.Printf("Monitoring bot for store %s (@%s)", store.Name, store.BotUsername)
+	}
+
+	log.Printf("Monitored %d active bots", len(stores))
+}
+
+// StartBotMonitoringRoutine starts a routine to monitor bots periodically
+func (b *BotManagerService) StartBotMonitoringRoutine() {
+	go func() {
+		ticker := time.NewTicker(30 * time.Minute) // Monitor every 30 minutes
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				b.MonitorBots()
+			}
+		}
+	}()
+
+	log.Println("Bot monitoring routine started")
 }

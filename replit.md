@@ -1,14 +1,16 @@
 # Overview
 
-This is a comprehensive pure Go terminal application for creating and managing multiple Telegram shopping bots. The system includes a mother bot (CodeRoot) that allows sellers to create their own sub-bots with different subscription plans. Built entirely in Go for maximum performance, cross-platform compatibility, and easy deployment on any system with Go installed.
+This is a comprehensive Telegram store hub system featuring a mother bot (CodeRoot) that manages multiple store sub-bots with advanced subscription plans. The system includes forced channel joining, sophisticated seller management panels, automatic sub-bot creation, and intelligent subscription renewal reminders. Built with Go backend for bot logic and Node.js/TypeScript for web management interface, with PostgreSQL database integration.
 
 ## Project Architecture 
 
-**Pure Go Terminal Application - No Web Frameworks**
-- Single binary executable for all platforms
-- Configuration via .env file only  
-- Terminal-based operation with comprehensive logging
-- No web interface - pure Telegram bot interaction
+**Hybrid Architecture - Go Backend + Web Interface**
+- Go backend for Telegram bot operations and business logic
+- Node.js/TypeScript frontend for web management interface
+- PostgreSQL database with comprehensive schemas and indexes
+- Service-oriented architecture with modular components
+- Configuration via environment variables with defaults
+- Comprehensive logging and monitoring systems
 - Mother bot creates and manages shop telegram bots automatically
 
 # User Preferences
@@ -16,6 +18,25 @@ This is a comprehensive pure Go terminal application for creating and managing m
 Preferred communication style: Simple, everyday language.
 
 # Recent Changes
+
+## ✅ Complete Telegram Store Hub System (August 7, 2025)
+- **Full Feature Implementation**: All 8 requested features successfully built and integrated
+- **Mother Bot (CodeRoot)**: Comprehensive Persian-language bot with complete store management
+- **Forced Channel Join**: Automatic membership verification with customizable channel requirements
+- **Advanced Seller Panel**: Complete store management with product CRUD, order tracking, and sales analytics
+- **Three-Tier Plans**: Free (10 products, 5%), Pro (200 products, 5%), VIP (unlimited, 0%) with automatic limits
+- **Admin Management**: Full admin panel with system stats, user management, and broadcast capabilities
+- **Automatic Sub-Bot Creation**: Simulated bot creation system with status tracking and notifications
+- **Smart Reminder System**: Automated subscription renewal reminders (7, 3, 1 days) with smart deduplication
+- **Complete Testing Suite**: Comprehensive test coverage for all services and workflow validation
+
+## ✅ Database & Services Architecture (August 7, 2025)
+- **PostgreSQL Integration**: Full database schema with optimized indexes and performance monitoring
+- **Service Layer**: Modular service architecture with proper separation of concerns
+- **Configuration Management**: Environment-based configuration with sensible defaults
+- **Error Handling**: Comprehensive error handling with user-friendly Persian messages
+- **Session Management**: Stateful conversation handling with proper cleanup
+- **Performance Optimization**: Database indexes, connection pooling, and query optimization
 
 ## ✅ Comprehensive Installation System (August 7, 2025)
 - **Complete Setup Scripts**: Full automation for all prerequisites and dependencies
